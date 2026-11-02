@@ -6,11 +6,14 @@ When a version is tagged, its section here becomes the GitHub release notes, and
 <!--
 How to add a version: copy this above the newest entry and fill it in.
 
-## v1.2.0 - 2026-12-01
+## vX.Y.Z - YYYY-MM-DD
 - **Windows:** what changed on Windows
 - **Linux:** what changed on Linux
 - **Both:** what changed everywhere
 -->
+
+## v1.2.0 - 2026-11-02
+- **Both:** The window is now split into two tabs, **Alerts** and **Sounds**, so it takes up less space. Start/Stop, Test alert and the status line stay visible on both tabs.
 
 ## v1.1.3 - 2026-11-02
 - **Linux:** Alert notifications now disappear by themselves after 3 seconds instead of staying on screen until you close them. They still show over the fullscreen game.

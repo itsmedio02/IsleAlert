@@ -764,9 +764,17 @@ def run_gui(args):
     frm = ttk.Frame(root, padding=12)
     frm.grid()
 
-    ttk.Label(frm, text="Game window").grid(row=0, column=0, sticky="w")
+    # Two tabs keep the window small: alerts (window, thresholds, live levels) and sounds.
+    tabs = ttk.Notebook(frm)
+    tabs.grid(row=0, column=0, columnspan=4, sticky="we")
+    alerts = ttk.Frame(tabs, padding=10)
+    sound_tab = ttk.Frame(tabs, padding=10)
+    tabs.add(alerts, text="Alerts")
+    tabs.add(sound_tab, text="Sounds")
+
+    ttk.Label(alerts, text="Game window").grid(row=0, column=0, sticky="w")
     win_var = tk.StringVar(value=cfg["window"])
-    combo = ttk.Combobox(frm, textvariable=win_var, width=40)
+    combo = ttk.Combobox(alerts, textvariable=win_var, width=40)
     combo.grid(row=0, column=1, columnspan=2, sticky="we")
 
     def refresh_windows():
@@ -778,25 +786,24 @@ def run_gui(args):
                     win_var.set(t)
                     break
 
-    ttk.Button(frm, text="Refresh", command=refresh_windows).grid(row=0, column=3, padx=(6, 0))
+    ttk.Button(alerts, text="Refresh", command=refresh_windows).grid(row=0, column=3, padx=(6, 0))
     refresh_windows()
 
-    ttk.Label(frm, text="Alert at or below (%)").grid(row=1, column=1, sticky="w", pady=(10, 2))
+    ttk.Label(alerts, text="Alert at or below (%)").grid(row=1, column=1, sticky="w", pady=(10, 2))
     stats = {}
     for i, name in enumerate(("Hunger", "Thirst", "Oxygen")):
         r = 2 + i
-        ttk.Label(frm, text=name).grid(row=r, column=0, sticky="w", pady=2)
+        ttk.Label(alerts, text=name).grid(row=r, column=0, sticky="w", pady=2)
         var = tk.IntVar(value=cfg[name.lower()])
-        ttk.Spinbox(frm, from_=0, to=100, width=5, textvariable=var).grid(row=r, column=1, sticky="w")
-        bar = ttk.Progressbar(frm, length=150, maximum=100)
+        ttk.Spinbox(alerts, from_=0, to=100, width=5, textvariable=var).grid(row=r, column=1, sticky="w")
+        bar = ttk.Progressbar(alerts, length=150, maximum=100)
         bar.grid(row=r, column=2, padx=6)
-        lab = ttk.Label(frm, text="-", width=11)
+        lab = ttk.Label(alerts, text="-", width=11)
         lab.grid(row=r, column=3, sticky="w")
         stats[name] = (var, bar, lab)
 
     # ---- alert sounds: pick your own, preview, back to default
-    box = ttk.LabelFrame(frm, text="Alert sounds", padding=8)
-    box.grid(row=5, column=0, columnspan=4, sticky="we", pady=(10, 0))
+    box = sound_tab
     sound_labels = {}
     for i, name in enumerate(("Hunger", "Thirst", "Oxygen")):
         ttk.Label(box, text=name, width=8).grid(row=i, column=0, sticky="w", pady=2)
@@ -827,10 +834,10 @@ def run_gui(args):
     vol.bind("<ButtonRelease-1>", lambda _e: persist())
 
     front_var = tk.BooleanVar(value=bool(cfg["front"]))
-    ttk.Checkbutton(frm, text="Also pop this window to the front on an alert",
-                    variable=front_var).grid(row=6, column=0, columnspan=4, sticky="w", pady=(10, 0))
+    ttk.Checkbutton(alerts, text="Also pop this window to the front on an alert",
+                    variable=front_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
     status = ttk.Label(frm, text="Not running", foreground="#555")
-    status.grid(row=8, column=0, columnspan=4, sticky="w", pady=(10, 0))
+    status.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     def refresh_sounds():
         mine = custom_sounds({"sounds": sounds})
@@ -926,7 +933,7 @@ def run_gui(args):
 
     toggle = ttk.Button(frm, text="Start watching",
                         command=lambda: stop() if state["watcher"] else start())
-    toggle.grid(row=7, column=0, columnspan=2, sticky="we", pady=(10, 0))
+    toggle.grid(row=1, column=0, columnspan=2, sticky="we", pady=(10, 0))
     def test_alert():                                   # hunger, thirst, then oxygen sound
         notifier.send("Hunger", "Hunger test", "If you can see/hear this, alerts work.")
         root.after(2500, lambda: notifier.send(
@@ -935,7 +942,7 @@ def run_gui(args):
             "Oxygen", "Oxygen test", "If you can see/hear this, alerts work."))
 
     ttk.Button(frm, text="Test alert", command=test_alert
-               ).grid(row=7, column=2, columnspan=2, sticky="we", pady=(10, 0), padx=(6, 0))
+               ).grid(row=1, column=2, columnspan=2, sticky="we", pady=(10, 0), padx=(6, 0))
 
     def bring_front():
         root.deiconify()
