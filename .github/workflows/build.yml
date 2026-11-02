@@ -33,7 +33,7 @@ jobs:
           Copy-Item Hungry.wav, Thirsty.wav, Oxygen.wav dist/IsleAlert/
           New-Item -ItemType Directory pkg | Out-Null
           Move-Item dist/IsleAlert pkg/IsleAlert
-          Copy-Item README.txt pkg/
+          Copy-Item README.txt, CHANGELOG.md pkg/
           $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-$("${{ github.sha }}".Substring(0,7))" }
           Compress-Archive -Path pkg/* -DestinationPath "IsleAlert_$ver.zip"
           "ZIP=IsleAlert_$ver.zip" | Out-File -Append $env:GITHUB_ENV
@@ -44,8 +44,13 @@ jobs:
           name: IsleAlert
           path: pkg/
 
+      - name: Release notes from CHANGELOG.md
+        if: github.ref_type == 'tag'
+        run: python tools/changelog_section.py "${{ github.ref_name }}" > notes.md
+
       - name: Publish release (tag pushes only)
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ env.ZIP }}
+          body_path: notes.md
