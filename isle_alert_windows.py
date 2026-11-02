@@ -272,7 +272,88 @@ class AlertLogic:
 # ------------------------------ Windows pieces ------------------------------
 SETTINGS_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "isle-alert" / "settings.json"
 DEFAULTS = {"window": "", "hunger": 40, "thirst": 40, "oxygen": 60, "front": False, "sounds": {},
-            "volume": 100}
+            "volume": 100, "theme": "system"}
+THEMES = {"system": "Same as Windows", "light": "Light", "dark": "Dark"}
+DARK = {"bg": "#202124", "fg": "#e8eaed", "field": "#2d2e31", "button": "#3a3b3f",
+        "active": "#4a4b50", "border": "#45474b", "select": "#1c7ed6", "accent": "#2f9e44",
+        "dim": "#9aa0a6"}
+
+
+def windows_uses_dark():
+    """True if Windows is set to dark mode for apps."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as k:
+            return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except Exception:
+        return False
+
+
+def dark_title_bar(root, dark):
+    """Dark or light window title bar (Windows 10 2004+ / 11; ignored elsewhere)."""
+    try:
+        import ctypes
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        value = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):                          # DWMWA_USE_IMMERSIVE_DARK_MODE (new, old)
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value),
+                                                          ctypes.sizeof(value)) == 0:
+                break
+        root.withdraw()                                # repaint the title bar now
+        root.deiconify()
+    except Exception:
+        pass
+
+
+def apply_theme(root, style, native, mode, combos=()):
+    """Light = Windows' own look. Dark = the 'clam' look recoloured."""
+    dark = windows_uses_dark() if mode == "system" else mode == "dark"
+    if not dark:
+        style.theme_use(native)
+        style.configure("Status.TLabel", foreground="#555555")
+        root.configure(bg=style.lookup("TFrame", "background") or "SystemButtonFace")
+        for c in combos:
+            _popdown_colours(c, "SystemWindow", "SystemWindowText")
+        dark_title_bar(root, False)
+        return
+    c = DARK
+    style.theme_use("clam")
+    style.configure(".", background=c["bg"], foreground=c["fg"], fieldbackground=c["field"],
+                    bordercolor=c["border"], darkcolor=c["bg"], lightcolor=c["bg"],
+                    troughcolor=c["field"], selectbackground=c["select"],
+                    selectforeground="#ffffff", insertcolor=c["fg"], arrowcolor=c["fg"])
+    style.map(".", background=[("disabled", c["bg"]), ("active", c["active"])],
+              foreground=[("disabled", "#777777")])
+    style.configure("TButton", background=c["button"], bordercolor=c["border"])
+    style.map("TButton", background=[("pressed", c["bg"]), ("active", c["active"])])
+    style.configure("TNotebook", background=c["bg"], bordercolor=c["border"])
+    style.configure("TNotebook.Tab", background=c["button"], foreground=c["fg"], padding=(12, 4))
+    style.map("TNotebook.Tab", background=[("selected", c["bg"]), ("active", c["active"])])
+    for w in ("TCombobox", "TSpinbox"):
+        style.configure(w, fieldbackground=c["field"], background=c["button"], foreground=c["fg"])
+        style.map(w, fieldbackground=[("readonly", c["field"])], foreground=[("readonly", c["fg"])],
+                  background=[("active", c["active"])])
+    style.configure("TCheckbutton", indicatorbackground=c["field"], indicatorforeground=c["fg"])
+    style.map("TCheckbutton", background=[("active", c["bg"])],
+              indicatorbackground=[("selected", c["select"])])
+    style.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["field"],
+                    bordercolor=c["border"])
+    style.configure("Horizontal.TScale", background=c["button"], troughcolor=c["field"])
+    style.configure("Status.TLabel", foreground=c["dim"])
+    root.configure(bg=c["bg"])
+    for cb in combos:
+        _popdown_colours(cb, c["field"], c["fg"])
+    dark_title_bar(root, True)
+
+
+def _popdown_colours(combo, bg, fg):
+    """The drop-down list of a combobox isn't a ttk widget, so colour it directly."""
+    try:
+        lb = combo.tk.eval(f"ttk::combobox::PopdownWindow {combo}") + ".f.l"
+        combo.tk.call(lb, "configure", "-background", bg, "-foreground", fg)
+    except Exception:
+        pass
 SOUNDS_DIR = SETTINGS_FILE.parent / "sounds"                    # copies of the sounds you picked
 REPEATS = {"Hunger": 0, "Thirst": 0, "Oxygen": 15}          # seconds between repeats; 0 = only once
 SCRIPT_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -770,7 +851,7 @@ def run_gui(args):
     alerts = ttk.Frame(tabs, padding=10)
     sound_tab = ttk.Frame(tabs, padding=10)
     tabs.add(alerts, text="Alerts")
-    tabs.add(sound_tab, text="Sounds")
+    tabs.add(sound_tab, text="Settings")
 
     ttk.Label(alerts, text="Game window").grid(row=0, column=0, sticky="w")
     win_var = tk.StringVar(value=cfg["window"])
@@ -833,10 +914,28 @@ def run_gui(args):
                ).grid(row=3, column=3, padx=(4, 0), pady=(8, 0))
     vol.bind("<ButtonRelease-1>", lambda _e: persist())
 
+    style = ttk.Style(root)
+    native = style.theme_use()
+    ttk.Label(box, text="Theme", width=8).grid(row=4, column=0, sticky="w", pady=(8, 0))
+    theme_key = cfg.get("theme") if cfg.get("theme") in THEMES else "system"
+    theme_var = tk.StringVar(value=THEMES[theme_key])
+    theme_box = ttk.Combobox(box, textvariable=theme_var, values=list(THEMES.values()),
+                             state="readonly", width=18)
+    theme_box.grid(row=4, column=1, sticky="w", pady=(8, 0))
+
+    def current_theme():
+        return next((k for k, v in THEMES.items() if v == theme_var.get()), "system")
+
+    def on_theme(_e=None):
+        apply_theme(root, style, native, current_theme(), combos=(combo, theme_box))
+        persist()
+
+    theme_box.bind("<<ComboboxSelected>>", on_theme)
+
     front_var = tk.BooleanVar(value=bool(cfg["front"]))
     ttk.Checkbutton(alerts, text="Also pop this window to the front on an alert",
                     variable=front_var).grid(row=5, column=0, columnspan=4, sticky="w", pady=(10, 0))
-    status = ttk.Label(frm, text="Not running", foreground="#555")
+    status = ttk.Label(frm, text="Not running", style="Status.TLabel")
     status.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
     def refresh_sounds():
@@ -905,7 +1004,7 @@ def run_gui(args):
         t = thresholds()
         save_settings({"window": win_var.get().strip(), "hunger": t["Hunger"],
                        "thirst": t["Thirst"], "oxygen": t["Oxygen"], "front": front_var.get(),
-                       "sounds": sounds, "volume": notifier.volume})
+                       "sounds": sounds, "volume": notifier.volume, "theme": current_theme()})
 
     def stop():
         if state["watcher"]:
@@ -978,6 +1077,8 @@ def run_gui(args):
         stop()
         root.destroy()
 
+    root.update_idletasks()                         # the window must exist for the title bar colour
+    apply_theme(root, style, native, current_theme(), combos=(combo, theme_box))
     root.protocol("WM_DELETE_WINDOW", on_close)
     tick()
     root.mainloop()
