@@ -1,0 +1,13 @@
+Package: isle-alert
+Version: 0.0.0
+Section: games
+Priority: optional
+Architecture: all
+Depends: python3 (>= 3.8), python3-gi, gir1.2-gtk-3.0, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-pipewire, python3-numpy, python3-pil, libnotify-bin, libglib2.0-bin, pulseaudio-utils, xdg-desktop-portal
+Recommends: xdg-desktop-portal-gnome | xdg-desktop-portal-kde | xdg-desktop-portal-gtk, gstreamer1.0-libav
+Maintainer: Isle Alert <isle-alert@localhost>
+Description: Hunger, thirst and oxygen alerts for The Isle
+ Watches the game window (other apps can cover it) and shows a desktop
+ notification with a sound when your dinosaur's hunger, thirst or oxygen
+ drops below the level you set. It only reads pixels from the screen share;
+ nothing is injected into the game.

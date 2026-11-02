@@ -4,6 +4,7 @@ cd /d "%~dp0"
 title Build Isle Alert
 
 if not exist isle_alert_windows.py goto missing
+if not exist isle_core.py goto missing
 if not exist Hungry.wav goto missing
 if not exist Thirsty.wav goto missing
 if not exist Oxygen.wav goto missing
@@ -49,7 +50,7 @@ exit /b 0
 
 :missing
 echo.
-echo build_exe.bat must sit in the same folder as isle_alert_windows.py,
+echo build_exe.bat must sit in the same folder as isle_alert_windows.py, isle_core.py,
 echo Hungry.wav, Thirsty.wav and Oxygen.wav. If you opened it from inside the zip,
 echo right-click the zip - Extract All - first.
 pause

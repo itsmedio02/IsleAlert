@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=The Isle Alert
+GenericName=Hunger, thirst and oxygen alerts
+Comment=Notifies you when your dinosaur gets hungry, thirsty or short of air
+Exec=isle-alert
+Icon=isle-alert
+Terminal=false
+Categories=Game;
+StartupWMClass=isle-alert

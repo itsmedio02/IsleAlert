@@ -1,0 +1,3 @@
+#!/bin/sh
+# Use the system Python on purpose: the GTK/GStreamer bindings only exist there.
+exec /usr/bin/python3 /usr/lib/isle-alert/isle_alert_gui.py "$@"

@@ -4,3 +4,4 @@ IsleAlert/
 *.spec
 *.zip
 __pycache__/
+linux/dist/

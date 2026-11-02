@@ -27,246 +27,15 @@ from pathlib import Path
 
 import numpy as np
 
-# --------------------------------------------------------------------------
-# Where the icons are. Measured on a 2560x1440 screenshot of the game and
-# scaled by window height, anchored to the bottom-right corner, so other
-# resolutions should work too (as long as the in-game UI scale is unchanged).
-#   x0/x1 : narrow column band through the middle of the icon
-#   top   : y of the top of the icon outline
-#   bottom: y of the bottom of the icon outline
-# --------------------------------------------------------------------------
-REF_W, REF_H = 2560, 1440
-ICONS = {
-    # Stomach / drop: the fill is a flat pale colour clipped at a horizontal line.
-    # "edge": a side of the icon's hexagon (x, y from, y to) that must be a sharp line.
-    "Hunger": {"x0": 2404, "x1": 2414, "top": 1132, "bottom": 1206,
-               "edge": (2343, 1145, 1192)},
-    "Thirst": {"x0": 2444, "x1": 2448, "top": 1223, "bottom": 1307,
-               "edge": (2499, 1238, 1290)},
-    # O2: the whole hexagon fills with teal. The strip sits left of the "O2" text, so it
-    # can see the fill line from the bottom up to about 80%; above that it reads 100%.
-    # The icon is invisible while oxygen is at 100%, so "not on screen" is read as 100%.
-    "Oxygen": {"x0": 2201, "x1": 2209, "top": 1145, "bottom": 1227,
-               "band_top": 1163, "band_bottom": 1208, "min_ref": 80, "teal": True,
-               "saturate": True, "full": 1.0, "hidden_level": 1.0,
-               "present": [(2194, 1170, 2201, 1203), (2271, 1170, 2278, 1203)],   # lit hexagon edges
-               "glyph": (2207, 1163, 2261, 1204)},                                # the "O2" text
-}
-FULL_FRACTION = 0.93   # the fill never quite reaches the outline; treat this as 100%
-COLOUR_TOL = 45        # how far a pixel may differ from the fill colour
-
-# ------------------------------ reading the icons --------------------------
-def _to_px(w, h, x, y):
-    """Reference (2560x1440) coordinates -> pixels of a w x h frame, bottom-right anchored."""
-    s = h / REF_H
-    return int(round(w - (REF_W - x) * s)), int(round(h - (REF_H - y) * s))
-
-
-def _box(rgb, b):
-    h, w = rgb.shape[:2]
-    ax0, ay0 = _to_px(w, h, b[0], b[1])
-    ax1, ay1 = _to_px(w, h, b[2], b[3])
-    return rgb[max(ay0, 0):ay1 + 1, max(ax0, 0):max(ax1, ax0 + 1)].astype(np.int16)
-
-
-def _icon_visible(rgb, spec):
-    """True only if both lit cyan hexagon edges AND the pale glyph are there."""
-    for b in spec["present"]:                        # tall thin boxes on the hexagon's sides
-        px = _box(rgb, b)
-        if px.size == 0:
-            return False
-        cyan = ((px[..., 1] >= 120) & (px[..., 2] >= 120) &
-                (px[..., 1] - px[..., 0] >= 30) & (px[..., 2] - px[..., 0] >= 30))
-        if cyan.any(axis=1).mean() < 0.85:           # a real edge runs the whole height
-            return False
-    if "glyph" in spec:
-        px = _box(rgb, spec["glyph"])
-        if px.size == 0:
-            return False
-        pale = (px[..., 0] >= 170) & (px[..., 1] >= 200) & (px[..., 2] >= 200)
-        if pale.mean() < 0.10:                       # the real "O2" text covers ~29% of this box
-            return False
-    return True
-
-
-def measure(rgb, spec):
-    """Fill level 0.0-1.0 of one icon, or None if it isn't on screen / can't be read."""
-    h, w = rgb.shape[:2]
-    x0, band_top = _to_px(w, h, spec["x0"], spec.get("band_top", spec["top"]))
-    x1, band_bot = _to_px(w, h, spec["x1"], spec.get("band_bottom", spec["bottom"]))
-    _, top = _to_px(w, h, 0, spec["top"])
-    _, bot = _to_px(w, h, 0, spec["bottom"])
-    x1 = max(x1, x0 + 1)
-    if x0 < 0 or band_top < 0 or band_bot >= h or band_bot - band_top < 12:
-        return None
-
-    if "edge" in spec and not _icon_edge_ok(rgb, spec):
-        return None                                  # blurred or covered: a menu is open
-
-    # The icon must really be on screen: its shape has to be there, not just something bright.
-    if "present" in spec and not _icon_visible(rgb, spec):
-        return spec.get("hidden_level")              # icon not drawn (O2: means 100%)
-
-    band = rgb[band_top:band_bot + 1, x0:x1].astype(np.int16)    # rows x cols x 3
-    n = band.shape[0]
-    if "present" not in spec and band[: max(3, n // 8)].mean(axis=2).max() < 110:
-        return None                                  # glyph outline missing: HUD hidden
-
-    col = np.median(band, axis=1)                    # one colour per row
-    r0, r1 = int(n * 0.86), int(n * 0.93)
-    ref = np.median(col[r0:r1 + 1], axis=0)          # fill colour near the bottom
-    if ref.mean() < spec.get("min_ref", 150):
-        return 0.0                                   # bottom is dark -> bar (almost) empty
-    if spec.get("teal") and not (ref[1] > ref[0] + 50 and ref[2] > ref[0] + 50):
-        return None                                  # not the fill colour -> not the icon
-
-    i = r0                                           # walk up while it's still "fill"
-    while i > 0 and np.abs(col[i - 1] - ref).max() <= COLOUR_TOL:
-        i -= 1
-    if i == 0 and spec.get("saturate"):
-        return 1.0                                   # fill line is above this strip
-    level = (bot - (band_top + i)) / max(bot - top, 1)
-    return float(min(1.0, max(0.0, level / spec.get("full", FULL_FRACTION))))
+# Reading the HUD icons, the alert rules, the countdown and the version are shared with the
+# Linux app and live in isle_core.py (next to this file).
+import isle_core
+from isle_core import __version__, AlertLogic, countdown_text, level_text, read_frame, run_test
 
 
 def dump_o2(rgb):
-    """Save the HUD corner as isle_o2_debug.png next to the script (to inspect a false O2 alarm)."""
-    try:
-        from PIL import Image
-        h, w = rgb.shape[:2]
-        corner = np.ascontiguousarray(rgb[int(h * 0.6):, int(w * 0.7):])
-        Image.fromarray(corner).save(SCRIPT_DIR / "isle_o2_debug.png")
-    except Exception:
-        pass
-
-
-# ------------------------------ menus & sharp edges --------------------------
-def _line_fraction(rgb, horizontal, c, a0, a1, s):
-    """How much of the stretch a0..a1 carries a thin, sharp, bright cyan line along row c
-    (horizontal) or column c. A few pixels of misplacement are allowed. Blurred lines,
-    soft gradients and plain bright areas do not count."""
-    h, w = rgb.shape[:2]
-    t = max(2, int(round(3 * s)))                    # search +-t around c
-    d = max(2, int(round(4 * s)))                    # contrast measured d px either side
-    lo, hi = c - t - d, c + t + d + 1
-    if lo < 0 or hi > (h if horizontal else w):
-        return 0.0
-    idx = np.arange(max(a0, 0), min(a1, w if horizontal else h), max(1, int(round(4 * s))))
-    if idx.size == 0:
-        return 0.0
-    cut = rgb[lo:hi, idx] if horizontal else rgb[idx, lo:hi].transpose(1, 0, 2)
-    cut = cut.astype(np.int16)                       # (across, along, 3)
-    g, r = cut[..., 1], cut[..., 0]
-    k = g[d:d + 2 * t + 1].argmax(axis=0) + d        # brightest pixel near c, per position
-    cols = np.arange(g.shape[1])
-    p = g[k, cols]
-    ok = ((p >= 120) & (p - r[k, cols] >= 30) &
-          (p - g[k - d, cols] >= 35) & (p - g[k + d, cols] >= 35))
-    return float(ok.mean())
-
-
-def _icon_edge_ok(rgb, spec):
-    """The hexagon around the icon must be a sharp line. In the Escape menu the HUD is
-    blurred and in the Status Report it is covered - then the icon can't be trusted."""
-    h, w = rgb.shape[:2]
-    ex, ey0, ey1 = spec["edge"]
-    x, y0 = _to_px(w, h, ex, ey0)
-    _, y1 = _to_px(w, h, ex, ey1)
-    return _line_fraction(rgb, False, x, y0, y1, h / REF_H) >= 0.7
-
-
-# Escape menu: the outlines of its buttons (RESUME ... QUIT) on the left of the screen.
-ESC_LINES = (814, 897, 914, 998, 1114, 1198, 1214, 1297, 1314, 1398)
-# Status Report (and its Group / Mutations / Nest tabs): full-width frame lines.
-FRAME_TOP, FRAME_BOTTOM = (9,), (1297, 1322, 1404)
-
-
-def detect_menu(rgb):
-    """Name of the game menu on screen, or None during normal play."""
-    h, w = rgb.shape[:2]
-    s = h / REF_H
-    x0, x1 = int(70 * s), int(440 * s)
-    hits = sum(_line_fraction(rgb, True, int(round(h - (REF_H - y) * s)), x0, x1, s) >= 0.8
-               for y in ESC_LINES)
-    if hits >= 7:
-        return "Escape menu"
-    rows = ([int(round(y * s)) for y in FRAME_TOP] +
-            [int(round(h - (REF_H - y) * s)) for y in FRAME_BOTTOM])
-    hits = sum(_line_fraction(rgb, True, y, int(w * 0.06), int(w * 0.94), s) >= 0.8
-               for y in rows)
-    if hits >= 3:
-        return "Status report"
-    return None
-
-
-def measure_all(rgb):
-    levels = {name: measure(rgb, spec) for name, spec in ICONS.items()}
-    if levels.get("Hunger") is None and levels.get("Thirst") is None:
-        levels["Oxygen"] = None                      # whole HUD hidden: O2 can't be judged
-    return levels
-
-
-def read_frame(rgb):
-    """(menu name or None, levels). Nothing is measured while a game menu is open."""
-    menu = detect_menu(rgb)
-    if menu:
-        return menu, {name: None for name in ICONS}
-    return None, measure_all(rgb)
-
-
-class AlertLogic:
-    """Alert when a stat drops below its threshold, repeat while it stays low."""
-
-    MESSAGES = {"Hunger": "Your dinosaur needs to eat soon.",
-                "Thirst": "Your dinosaur needs to drink soon.",
-                "Oxygen": "Your dinosaur is running out of air - get to the surface!"}
-
-    CONFIRM = {"Hunger": 2, "Thirst": 2, "Oxygen": 2}   # low readings in a row before alerting
-
-    def __init__(self, notifier, thresholds, repeats, blind_after):
-        self.n, self.th, self.repeats, self.blind_after = notifier, thresholds, repeats, blind_after
-        self.last_alert = {}
-        self.streak = {}
-        self.unreadable_since = None
-        self.told_blind = False
-
-    def paused(self):
-        """A game menu is open: nothing on screen can be trusted, so change nothing."""
-        self.streak.clear()
-        self.unreadable_since = None
-
-    def update(self, levels, now):
-        if all(v is None for k, v in levels.items() if k != "Oxygen"):   # O2 can't tell us
-            self.streak.clear()
-            self.unreadable_since = self.unreadable_since or now
-            if now - self.unreadable_since > self.blind_after and not self.told_blind:
-                self.told_blind = True
-                self.n.send("blind", "Can't see the HUD icons",
-                            "Is the HUD hidden, or is this the wrong window?")
-            return
-        self.unreadable_since, self.told_blind = None, False
-
-        for name, level in levels.items():
-            if level is None:
-                self.streak[name] = 0
-                if name == "Oxygen":                     # icon gone again = air is fine
-                    self.last_alert.pop(name, None)
-                continue
-            limit = self.th[name] / 100.0
-            if level > limit:
-                self.streak[name] = 0
-            if level <= limit:
-                self.streak[name] = self.streak.get(name, 0) + 1
-                if self.streak[name] < self.CONFIRM.get(name, 1):
-                    continue
-                last, every = self.last_alert.get(name), self.repeats.get(name, 0)
-                if last is None or (every and now - last >= every):    # every=0 -> only once
-                    self.last_alert[name] = now
-                    self.n.send(name, f"{name} is low: {level * 100:.0f}%",
-                                self.MESSAGES.get(name, ""))
-            elif level > limit + 0.10:                   # recovered -> re-arm
-                self.last_alert.pop(name, None)
-
+    """Save isle_o2_debug.png next to the app (or in %APPDATA%\\isle-alert if that fails)."""
+    return isle_core.dump_o2(rgb, [SCRIPT_DIR, SETTINGS_FILE.parent])
 
 
 # ------------------------------ Windows pieces ------------------------------
@@ -738,7 +507,7 @@ class Watcher:
             dump_o2(rgb)                                 # lets you check what it "saw"
         self.status = f"Watching ({rgb.shape[1]}x{rgb.shape[0]})"
         if self.debug:
-            print({k: None if v is None else round(v * 100) for k, v in self.levels.items()},
+            print({k: None if v is None else level_text(k, v) for k, v in self.levels.items()},
                   flush=True)
         self.logic.update(self.levels, now)
 
@@ -797,36 +566,6 @@ class Watcher:
                                "The game may be minimised or paused - alerts are not working.")
 
 
-
-def save_png(rgb, path):
-    from PIL import Image
-    Image.fromarray(rgb).save(path)
-    print("saved", path)
-
-
-def run_test(args):
-    from PIL import Image
-    rgb = np.array(Image.open(args.test).convert("RGB"))
-    menu, levels = read_frame(rgb)
-    print(f"Game menu: {menu or 'none (normal play)'}")
-    if menu:
-        levels = measure_all(rgb)                        # show what it would read anyway
-    for name, level in levels.items():
-        print(f"{name}: {'not on screen / unreadable' if level is None else f'{level * 100:.0f}%'}")
-    h, w = rgb.shape[:2]
-    img = rgb.copy()
-    for spec in ICONS.values():                          # draw the sampled bands in red
-        x0, bt = _to_px(w, h, spec["x0"], spec.get("band_top", spec["top"]))
-        x1, bb = _to_px(w, h, spec["x1"], spec.get("band_bottom", spec["bottom"]))
-        x1 = max(x1, x0 + 1)
-        if x0 < 2 or bt < 0 or bb >= h:
-            continue
-        img[bt:bb + 1, x0 - 2:x0] = (255, 0, 0)
-        img[bt:bb + 1, x1:x1 + 2] = (255, 0, 0)
-    out = Path(args.test).with_name("isle_alert_check.png")
-    save_png(img[int(h * 0.7):, int(w * 0.8) - 200:], out)
-
-
 def run_gui(args):
     import shutil
     import tkinter as tk
@@ -840,7 +579,7 @@ def run_gui(args):
     state = {"watcher": None}
 
     root = tk.Tk()
-    root.title("The Isle alert")
+    root.title(f"The Isle alert {__version__}")
     root.resizable(False, False)
     frm = ttk.Frame(root, padding=12)
     frm.grid()
@@ -871,6 +610,7 @@ def run_gui(args):
     refresh_windows()
 
     ttk.Label(alerts, text="Alert at or below (%)").grid(row=1, column=1, sticky="w", pady=(10, 2))
+    ttk.Label(alerts, text="Alert in").grid(row=1, column=4, sticky="w", pady=(10, 2))
     stats = {}
     for i, name in enumerate(("Hunger", "Thirst", "Oxygen")):
         r = 2 + i
@@ -881,7 +621,9 @@ def run_gui(args):
         bar.grid(row=r, column=2, padx=6)
         lab = ttk.Label(alerts, text="-", width=11)
         lab.grid(row=r, column=3, sticky="w")
-        stats[name] = (var, bar, lab)
+        eta = ttk.Label(alerts, text="-", width=12)
+        eta.grid(row=r, column=4, sticky="w")
+        stats[name] = (var, bar, lab, eta)
 
     # ---- alert sounds: pick your own, preview, back to default
     box = sound_tab
@@ -993,7 +735,7 @@ def run_gui(args):
 
     def thresholds():
         out = {}
-        for name, (var, _bar, _lab) in stats.items():
+        for name, (var, _bar, _lab, _eta) in stats.items():
             try:
                 out[name] = max(0, min(100, int(var.get())))
             except (tk.TclError, ValueError):
@@ -1054,14 +796,16 @@ def run_gui(args):
         if w:
             w.logic.th.update(thresholds())               # threshold changes apply live
             w.check_stalled()
-            for name, (_var, bar, lab) in stats.items():
+            for name, (_var, bar, lab, eta) in stats.items():
                 if name not in w.levels:
                     bar["value"], text = 0, "-"
                 elif w.levels[name] is None:
                     bar["value"], text = 0, "unreadable"
                 else:
-                    bar["value"], text = w.levels[name] * 100, f"{w.levels[name] * 100:.0f}%"
+                    bar["value"], text = w.levels[name] * 100, level_text(name, w.levels[name])
                 lab.config(text=text)
+                eta.config(text=countdown_text(w.logic.drain, name, w.levels.get(name),
+                                               w.logic.th[name], time.time()))
             status.config(text=w.status)
             if w.control is None and state["watcher"]:     # window closed under us
                 toggle.config(text="Start watching")
@@ -1117,6 +861,7 @@ def main():
     p.add_argument("--debug", action="store_true",
                    help="print every reading and save isle_o2_debug.png (also in the window)")
     p.add_argument("--test", metavar="PNG", help="measure a screenshot file and exit")
+    p.add_argument("--version", action="version", version=f"Isle Alert {__version__}")
     p.add_argument("--notify-test", action="store_true", help="send a test alert and exit")
     args = p.parse_args()
     try:                                   # real pixel sizes, so windowed-mode cropping is exact
@@ -1131,7 +876,7 @@ def main():
     args.thirst = args.below if args.thirst is None else args.thirst
 
     if args.test:
-        run_test(args)
+        run_test(args.test)
     elif args.notify_test:
         cfg = load_settings()
         n = WinNotifier(custom_sounds(cfg), volume=_volume(cfg))

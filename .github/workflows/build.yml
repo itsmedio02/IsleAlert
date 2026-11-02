@@ -1,4 +1,4 @@
-name: Build IsleAlert.exe
+name: Build Isle Alert (Windows + Linux)
 
 on:
   push:
@@ -10,7 +10,23 @@ permissions:
   contents: write   # needed to create a Release on tag pushes
 
 jobs:
-  build:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag must match __version__ in isle_core.py
+        if: github.ref_type == 'tag'
+        run: |
+          ver=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' isle_core.py)
+          if [ "v$ver" != "${{ github.ref_name }}" ]; then
+            echo "::error::Tag ${{ github.ref_name }} doesn't match __version__ = \"$ver\" in isle_core.py. Update one of them."
+            exit 1
+          fi
+          echo "Version $ver matches the tag."
+
+  windows:
+    needs: check-version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,21 +52,47 @@ jobs:
           Copy-Item README.txt, CHANGELOG.md pkg/
           $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-$("${{ github.sha }}".Substring(0,7))" }
           Compress-Archive -Path pkg/* -DestinationPath "IsleAlert_$ver.zip"
-          "ZIP=IsleAlert_$ver.zip" | Out-File -Append $env:GITHUB_ENV
 
       - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: IsleAlert
-          path: pkg/
+          name: IsleAlert-windows
+          path: IsleAlert_*.zip
+
+  linux:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build .deb
+        run: sh linux/build_deb.sh
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: IsleAlert-linux
+          path: linux/dist/*.deb
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
 
       - name: Release notes from CHANGELOG.md
-        if: github.ref_type == 'tag'
-        run: python tools/changelog_section.py "${{ github.ref_name }}" > notes.md
+        run: python3 tools/changelog_section.py "${{ github.ref_name }}" > notes.md
 
-      - name: Publish release (tag pushes only)
-        if: github.ref_type == 'tag'
+      - name: Publish release (Windows zip + Linux .deb)
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP }}
+          files: |
+            out/*.zip
+            out/*.deb
           body_path: notes.md
