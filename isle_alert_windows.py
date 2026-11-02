@@ -271,7 +271,8 @@ class AlertLogic:
 
 # ------------------------------ Windows pieces ------------------------------
 SETTINGS_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "isle-alert" / "settings.json"
-DEFAULTS = {"window": "", "hunger": 40, "thirst": 40, "oxygen": 60, "front": False, "sounds": {}}
+DEFAULTS = {"window": "", "hunger": 40, "thirst": 40, "oxygen": 60, "front": False, "sounds": {},
+            "volume": 100}
 SOUNDS_DIR = SETTINGS_FILE.parent / "sounds"                    # copies of the sounds you picked
 REPEATS = {"Hunger": 0, "Thirst": 0, "Oxygen": 15}          # seconds between repeats; 0 = only once
 SCRIPT_DIR = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
@@ -290,12 +291,90 @@ def load_settings():
     return cfg
 
 
+def _volume(cfg):
+    try:
+        return max(0, min(100, int(cfg.get("volume", 100))))
+    except (TypeError, ValueError):
+        return 100
+
+
 def save_settings(cfg):
     try:
         SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
         SETTINGS_FILE.write_text(json.dumps(cfg), encoding="utf-8")
     except Exception as exc:
         print("could not save settings:", exc, file=sys.stderr)
+
+
+def _find_hwnd(title):
+    """Handle of the top-level window with this title (exact match first, then partial)."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        return hwnd
+    found = []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum(h, _lparam):
+        n = user32.GetWindowTextLengthW(h)
+        if n and user32.IsWindowVisible(h):
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(h, buf, n + 1)
+            if title.lower() in buf.value.lower():
+                found.append(h)
+                return False
+        return True
+
+    user32.EnumWindows(enum, 0)
+    return found[0] if found else None
+
+
+def client_crop(title, frame_w, frame_h):
+    """(left, top, width, height) of the game's picture inside a captured frame, or None.
+    In windowed mode the capture includes the title bar and borders; the HUD positions are
+    measured from the game's own picture, so those have to be cut off first."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        hwnd = _find_hwnd(title)
+        if not hwnd:
+            return None
+        client = wintypes.RECT()
+        if not user32.GetClientRect(hwnd, ctypes.byref(client)):
+            return None
+        origin = wintypes.POINT(0, 0)
+        user32.ClientToScreen(hwnd, ctypes.byref(origin))
+        frame = wintypes.RECT()                        # the visible window, as Windows captures it
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                hwnd, 9, ctypes.byref(frame), ctypes.sizeof(frame)):   # DWMWA_EXTENDED_FRAME_BOUNDS
+            user32.GetWindowRect(hwnd, ctypes.byref(frame))
+        return crop_box(frame_w, frame_h, (frame.left, frame.top, frame.right, frame.bottom),
+                        (origin.x, origin.y, client.right, client.bottom))
+    except Exception:
+        return None
+
+
+def crop_box(frame_w, frame_h, window, client):
+    """Pure maths for client_crop. window = (left, top, right, bottom) on screen,
+    client = (x, y, width, height) on screen. Windows may report these in scaled (DPI)
+    units, so everything is converted to the frame's own pixels."""
+    wl, wt, wr, wb = window
+    cx, cy, cw, ch = client
+    if wr - wl <= 0 or wb - wt <= 0 or cw <= 0 or ch <= 0:
+        return None
+    sx, sy = frame_w / (wr - wl), frame_h / (wb - wt)
+    left, top = int(round((cx - wl) * sx)), int(round((cy - wt) * sy))
+    width, height = int(round(cw * sx)), int(round(ch * sy))
+    left, top = max(0, left), max(0, top)
+    width, height = min(width, frame_w - left), min(height, frame_h - top)
+    if width < frame_w * 0.5 or height < frame_h * 0.5:
+        return None                                    # nonsense: use the whole frame
+    if (left, top, width, height) == (0, 0, frame_w, frame_h):
+        return None                                    # fullscreen / borderless: nothing to cut
+    return left, top, width, height
 
 
 def window_titles():
@@ -377,7 +456,7 @@ def mci_length(path):
             pass
 
 
-def play_mci(path):
+def play_mci(path, volume=100):
     """Play an MP3/WMA/... file in the background. Returns the thread playing it."""
     import threading
 
@@ -390,6 +469,11 @@ def play_mci(path):
             return
         try:
             _mci(f"set {alias} time format milliseconds")
+            if volume < 100:
+                try:
+                    _mci(f"setaudio {alias} volume to {int(_gain(volume) * 1000)}")
+                except Exception:
+                    pass                               # plays at full volume instead
             length = int(_mci(f"status {alias} length") or 0)
             _mci(f"play {alias} from 0 to {length}")
             time.sleep(length / 1000 + 0.2)
@@ -419,13 +503,75 @@ def check_sound(path):
         return f"Windows couldn't play it ({exc})."
 
 
+def _gain(volume):
+    """Slider 0-100 -> loudness factor. Squared, so the slider feels even to the ear."""
+    return max(0.0, min(1.0, volume / 100.0)) ** 2
+
+
+def quieter_wav(path, volume):
+    """The WAV file's bytes with its samples turned down to this volume, or None if it
+    can't be done (then it plays at full volume)."""
+    import io
+    import wave
+    try:
+        with wave.open(str(path)) as w:
+            params, raw = w.getparams(), w.readframes(w.getnframes())
+        g, width = _gain(volume), params.sampwidth
+        if width == 1:                                   # 8-bit: unsigned, centred on 128
+            a = np.frombuffer(raw, np.uint8).astype(np.float32) - 128
+            out = (np.clip(a * g, -128, 127) + 128).astype(np.uint8).tobytes()
+        elif width == 2:
+            a = np.frombuffer(raw, "<i2").astype(np.float32)
+            out = np.clip(a * g, -32768, 32767).astype("<i2").tobytes()
+        elif width == 3:                                 # 24-bit: widen to 32, scale, narrow
+            b = np.frombuffer(raw, np.uint8).reshape(-1, 3)
+            a = (b[:, 0].astype(np.int32) | (b[:, 1].astype(np.int32) << 8) |
+                 (b[:, 2].astype(np.int32) << 16))
+            a = np.where(a >= 1 << 23, a - (1 << 24), a)
+            a = np.clip(a * g, -(1 << 23), (1 << 23) - 1).astype(np.int32)
+            out = a.astype("<i4").view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+        elif width == 4:
+            a = np.frombuffer(raw, "<i4").astype(np.float64)
+            out = np.clip(a * g, -(1 << 31), (1 << 31) - 1).astype("<i4").tobytes()
+        else:
+            return None
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setparams(params)
+            w.writeframes(out)
+        return buf.getvalue()
+    except Exception as exc:
+        print("could not change the volume of", path, "-", exc, file=sys.stderr)
+        return None
+
+
 class WinNotifier:
     """Windows toast notification + the alert's sound."""
 
-    def __init__(self, custom=None):
+    def __init__(self, custom=None, volume=100):
         self.on_alert = None                  # optional callback (used by the window)
         self.custom = dict(custom or {})      # sounds you picked replace the built-in ones
         self.threads = {}
+        self.volume = volume                  # 0-100, for all alert sounds
+        self._quiet = {}                      # (file, size, mtime, volume) -> WAV bytes
+
+    def _play_wav(self, winsound, path):
+        if self.volume >= 100:
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        if self.volume <= 0:
+            return
+        st = path.stat()
+        key = (str(path), st.st_size, st.st_mtime, self.volume)
+        if key not in self._quiet:
+            self._quiet = {key: quieter_wav(path, self.volume)}    # keep only the newest
+        data = self._quiet[key]
+        if data is None:
+            winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return
+        import threading                               # winsound can't play memory async
+        threading.Thread(target=winsound.PlaySound, args=(data, winsound.SND_MEMORY),
+                         daemon=True).start()
 
     def _file_for(self, key):
         mine = self.custom.get(key)
@@ -447,11 +593,11 @@ class WinNotifier:
             if path is None:
                 winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
             elif path.suffix.lower() == ".wav" and _wav_ok(path):
-                winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-            else:
+                self._play_wav(winsound, path)
+            elif self.volume > 0:
                 t = self.threads.get(key)
                 if t is None or not t.is_alive():
-                    self.threads[key] = play_mci(path)
+                    self.threads[key] = play_mci(path, self.volume)
         except Exception as exc:
             print("could not play the sound:", exc, file=sys.stderr)
 
@@ -478,6 +624,7 @@ class Watcher:
         self.levels, self.status = {}, "Starting..."
         self.last_frame, self.last_read = time.time(), 0.0
         self.stalled, self.control = False, None
+        self.crop, self.crop_for, self.crop_time = None, None, 0.0
 
     def _on_frame(self, frame):
         now = time.time()
@@ -491,6 +638,13 @@ class Watcher:
         if buf.ndim != 3:
             buf = buf.reshape(frame.height, frame.width, 4)
         rgb = buf[:, :, 2::-1]                         # BGR -> RGB (a view, no copy)
+        fh, fw = rgb.shape[:2]
+        if (fw, fh) != self.crop_for or now - self.crop_time > 5:
+            self.crop = client_crop(self.title, fw, fh)  # windowed: cut off title bar/borders
+            self.crop_for, self.crop_time = (fw, fh), now
+        if self.crop:
+            x, y, cw, ch = self.crop
+            rgb = rgb[y:y + ch, x:x + cw]
         menu, levels = read_frame(rgb)
         if menu:                                       # keep the last real readings on show
             self.logic.paused()
@@ -501,7 +655,7 @@ class Watcher:
         if self.debug and o2 is not None and o2 < 0.999 and now - getattr(self, "o2_dump", 0) > 30:
             self.o2_dump = now
             dump_o2(rgb)                                 # lets you check what it "saw"
-        self.status = f"Watching ({buf.shape[1]}x{buf.shape[0]})"
+        self.status = f"Watching ({rgb.shape[1]}x{rgb.shape[0]})"
         if self.debug:
             print({k: None if v is None else round(v * 100) for k, v in self.levels.items()},
                   flush=True)
@@ -599,7 +753,7 @@ def run_gui(args):
 
     cfg = load_settings()
     sounds = cfg["sounds"]
-    notifier = WinNotifier(custom_sounds(cfg))
+    notifier = WinNotifier(custom_sounds(cfg), volume=_volume(cfg))
     flag = {"front": False}
     notifier.on_alert = lambda: flag.update(front=True)
     state = {"watcher": None}
@@ -655,6 +809,22 @@ def run_gui(args):
                    ).grid(row=i, column=3, padx=(4, 0))
         ttk.Button(box, text="Default", command=lambda n=name: reset_sound(n)
                    ).grid(row=i, column=4, padx=(4, 0))
+
+    ttk.Label(box, text="Volume", width=8).grid(row=3, column=0, sticky="w", pady=(8, 0))
+    vol_var = tk.IntVar(value=notifier.volume)
+    vol_lab = ttk.Label(box, text=f"{notifier.volume}%", width=5)
+
+    def on_volume(value):
+        notifier.volume = int(round(float(value)))
+        vol_lab.config(text=f"{notifier.volume}%")
+
+    vol = ttk.Scale(box, from_=0, to=100, orient="horizontal", length=190,
+                    variable=vol_var, command=on_volume)
+    vol.grid(row=3, column=1, sticky="w", pady=(8, 0))
+    vol_lab.grid(row=3, column=2, sticky="w", padx=(6, 0), pady=(8, 0))
+    ttk.Button(box, text="\u25b6", width=3, command=lambda: notifier.play("Hunger")
+               ).grid(row=3, column=3, padx=(4, 0), pady=(8, 0))
+    vol.bind("<ButtonRelease-1>", lambda _e: persist())
 
     front_var = tk.BooleanVar(value=bool(cfg["front"]))
     ttk.Checkbutton(frm, text="Also pop this window to the front on an alert",
@@ -728,7 +898,7 @@ def run_gui(args):
         t = thresholds()
         save_settings({"window": win_var.get().strip(), "hunger": t["Hunger"],
                        "thirst": t["Thirst"], "oxygen": t["Oxygen"], "front": front_var.get(),
-                       "sounds": sounds})
+                       "sounds": sounds, "volume": notifier.volume})
 
     def stop():
         if state["watcher"]:
@@ -809,7 +979,8 @@ def run_gui(args):
 def run_console(args):
     if not args.window:
         sys.exit('Give the game window title, e.g.  --window "The Isle"')
-    notifier = WinNotifier(custom_sounds(load_settings()))
+    cfg = load_settings()
+    notifier = WinNotifier(custom_sounds(cfg), volume=_volume(cfg))
     logic = AlertLogic(notifier,
                        {"Hunger": args.hunger, "Thirst": args.thirst, "Oxygen": args.oxygen},
                        REPEATS, blind_after=300)
@@ -840,13 +1011,22 @@ def main():
     p.add_argument("--test", metavar="PNG", help="measure a screenshot file and exit")
     p.add_argument("--notify-test", action="store_true", help="send a test alert and exit")
     args = p.parse_args()
+    try:                                   # real pixel sizes, so windowed-mode cropping is exact
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
     args.hunger = args.below if args.hunger is None else args.hunger
     args.thirst = args.below if args.thirst is None else args.thirst
 
     if args.test:
         run_test(args)
     elif args.notify_test:
-        n = WinNotifier(custom_sounds(load_settings()))
+        cfg = load_settings()
+        n = WinNotifier(custom_sounds(cfg), volume=_volume(cfg))
         n.send("Hunger", "Hunger test", "If you can see/hear this, alerts work.")
         time.sleep(2.5)
         n.send("Thirst", "Thirst test", "If you can see/hear this, alerts work.")
