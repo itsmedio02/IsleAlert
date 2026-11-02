@@ -1,0 +1,51 @@
+name: Build IsleAlert.exe
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create a Release on tag pushes
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: python -m pip install windows-capture numpy winotify pillow pyinstaller
+
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed --name IsleAlert
+          --collect-all windows_capture --hidden-import winsound isle_alert_windows.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item Hungry.wav, Thirsty.wav, Oxygen.wav dist/IsleAlert/
+          New-Item -ItemType Directory pkg | Out-Null
+          Move-Item dist/IsleAlert pkg/IsleAlert
+          Copy-Item README.txt pkg/
+          $ver = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev-$("${{ github.sha }}".Substring(0,7))" }
+          Compress-Archive -Path pkg/* -DestinationPath "IsleAlert_$ver.zip"
+          "ZIP=IsleAlert_$ver.zip" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: IsleAlert
+          path: pkg/
+
+      - name: Publish release (tag pushes only)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP }}

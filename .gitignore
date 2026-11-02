@@ -1,0 +1,6 @@
+build/
+dist/
+IsleAlert/
+*.spec
+*.zip
+__pycache__/
