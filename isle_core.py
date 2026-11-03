@@ -7,12 +7,14 @@ linux/isle_alert.py + linux/isle_alert_gui.py (Linux) import everything from her
 made here reaches both apps.
 """
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
-__version__ = "1.3.0"     # also the GitHub tag (v1.3.0) and the Linux package version
+__version__ = "1.4.0"     # also the GitHub tag (v1.4.0) and the Linux package version
 
 # --------------------------------------------------------------------------
 # Where the icons are. Measured on a 2560x1440 screenshot of the game and
@@ -408,6 +410,79 @@ def level_text(name, level):
     if floor is not None and level >= 0.999:
         return f"{floor}%+"
     return f"{level * 100:.0f}%"
+
+
+# ------------------------------ launching with the game ---------------------
+# Steam launch options:  <Isle Alert> --with-game %command%
+# Everything after --with-game is the game's own command line, which Steam fills in.
+GAME_ARG = "--with-game"
+GAME_ENV_PREFIX = "ISLE_ALERT_GAME_"     # variables Isle Alert set aside, given back to the game
+STEAM_ONLY_VARS = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONPATH", "PYTHONHOME")
+
+
+def split_game_command(argv):
+    """(Isle Alert's own arguments, the game's command line or None)."""
+    if GAME_ARG not in argv:
+        return list(argv), None
+    i = argv.index(GAME_ARG)
+    return list(argv[:i]), list(argv[i + 1:])
+
+
+def game_folder(command):
+    """The game's install folder (the one in steamapps/common), from its command line.
+    Falls back to the folder of the .exe, or None if no .exe is on the command line."""
+    for arg in command:
+        if not arg.lower().endswith(".exe"):
+            continue
+        exe = Path(arg)
+        if not exe.is_file():
+            continue
+        folder = exe.resolve().parent
+        for parent in (folder, *folder.parents):
+            if parent.parent.name.lower() == "common" and parent.parent.parent.name.lower() == "steamapps":
+                return parent
+        return folder
+    return None
+
+
+def game_env():
+    """Our environment, cleaned up for the game: variables set aside at start-up go back,
+    and the ones the packaged Windows app (PyInstaller) adds for itself are dropped."""
+    env = dict(os.environ)
+    env.pop("ISLE_ALERT_REEXEC", None)
+    for key in [k for k in env if k.startswith(GAME_ENV_PREFIX)]:
+        env[key[len(GAME_ENV_PREFIX):]] = env.pop(key)
+    if getattr(sys, "frozen", False):
+        for key in [k for k in env if k.startswith(("_PYI", "_MEI"))]:
+            del env[key]
+        for key in ("TCL_LIBRARY", "TK_LIBRARY"):
+            env.pop(key, None)
+    return env
+
+
+def start_game(command):
+    """Start the game exactly as Steam asked. Returns the process."""
+    if not command:
+        raise RuntimeError(f"Nothing after {GAME_ARG}. In Steam's launch options use:\n"
+                           f"  <Isle Alert> {GAME_ARG} %command%")
+    if os.name == "nt" and getattr(sys, "frozen", False):
+        try:                       # PyInstaller changed the DLL search path; don't pass it on
+            import ctypes
+            ctypes.windll.kernel32.SetDllDirectoryW(None)
+        except Exception:
+            pass
+    print("Starting the game:", subprocess.list2cmdline(command), flush=True)
+    return subprocess.Popen(command, env=game_env())
+
+
+def wait_for_game(game):
+    """Used when the window can't open: never leave before the game does, or Steam would
+    think the game had closed."""
+    if game is not None:
+        try:
+            game.wait()
+        except KeyboardInterrupt:
+            pass
 
 
 # ------------------------------ test mode ----------------------------------

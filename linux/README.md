@@ -6,6 +6,11 @@ countdown are shared with the Windows app in `../isle_core.py`.
 **Install:** download `isle-alert_<version>_all.deb` from the GitHub release, then
 `sudo apt install ./isle-alert_<version>_all.deb` and start **The Isle Alert** from the app menu.
 
+**Start it with the game:** in Steam, The Isle - Properties - Launch Options:
+`isle-alert --with-game %command%` (other launch options such as `gamemoderun` go after `--with-game`).
+Isle Alert starts the game, starts watching once the game window is open (found with `xwininfo`
+from x11-utils), and closes when the game closes.
+
 **Build it yourself:** `sh linux/build_deb.sh` (from the repo root) writes `linux/dist/isle-alert_<version>_all.deb`.
 The version comes from `__version__` in `isle_core.py`. GitHub Actions builds it the same way on every push,
 and attaches it to the release when a `v*` tag is pushed.

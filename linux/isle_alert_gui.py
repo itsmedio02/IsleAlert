@@ -8,14 +8,38 @@ set. It only reads the pixels of the HUD icons - nothing is injected into the ga
 
 It reuses the icon reading and alert rules from isle_alert.py, which must sit in the same
 folder. Normally you install the .deb and start "The Isle Alert" from the app menu.
+
+To start it together with the game, put this in Steam - The Isle - Properties - Launch Options:
+    isle-alert --with-game %command%
+Isle Alert then starts the game, starts watching once the game window is open, and closes
+when the game closes.
 """
 import argparse
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 
-import gi
+
+def _set_steam_env_aside():
+    """Steam hands its launch options library paths meant for the game (LD_LIBRARY_PATH,
+    LD_PRELOAD for the overlay...). They can break the system Python/GTK, so restart without
+    them; isle_core.game_env() gives them back to the game. Has to run before any import that
+    loads libraries. Names: isle_core.STEAM_ONLY_VARS and GAME_ENV_PREFIX."""
+    if "--with-game" not in sys.argv or os.environ.get("ISLE_ALERT_REEXEC"):
+        return
+    os.environ["ISLE_ALERT_REEXEC"] = "1"
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONPATH", "PYTHONHOME"):
+        if key in os.environ:
+            os.environ["ISLE_ALERT_GAME_" + key] = os.environ.pop(key)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_set_steam_env_aside()
+
+import gi  # noqa: E402
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
@@ -26,8 +50,8 @@ import numpy as np  # noqa: E402
 from isle_alert import (CONFIG_DIR, SETTINGS_FILE, SOUNDS, SOUNDS_DIR,  # noqa: E402
                         TOKEN_FILE, Notifier, custom_sounds, due, dump_o2,
                         load_settings_file, open_portal_stream, pipeline_variants)
-from isle_core import (__version__, AlertLogic, countdown_text, level_text,  # noqa: E402
-                       read_frame)
+from isle_core import (__version__, AlertLogic, countdown_text, game_folder,  # noqa: E402
+                       level_text, read_frame, split_game_command, start_game, wait_for_game)
 
 DEFAULTS = {"hunger": 40, "thirst": 40, "oxygen": 60, "sounds": {}, "volume": 100, "theme": "system"}
 THEMES = (("system", "Same as system"), ("light", "Light"), ("dark", "Dark"))
@@ -149,6 +173,86 @@ def save_settings(cfg):
         print("could not save settings:", exc, file=sys.stderr)
 
 
+class GameWatch:
+    """The game Isle Alert started (--with-game): is it still running, and is its window open?
+    Wayland doesn't let apps see other windows, but Proton games are X11 windows (XWayland),
+    which xwininfo can list."""
+
+    def __init__(self, process, command):
+        self.process, self.folder = process, game_folder(command)
+        self.proc_since = None             # when the game's own .exe was first seen running
+
+    def running(self):
+        return self.process.poll() is None   # Steam's wrapper stays until the game has closed
+
+    def window_open(self):
+        now = time.time()
+        if self._game_process():
+            self.proc_since = self.proc_since or now
+        else:
+            self.proc_since = None
+        x11 = x11_game_window()
+        if x11:
+            return True
+        ran = now - self.proc_since if self.proc_since else 0
+        # Can't list windows (no xwininfo/X11): give the game time to open it after it
+        # starts. Not on the X11 list for long: it may be a Wayland window - try anyway.
+        return ran >= (20 if x11 is None else 90)
+
+    def _game_process(self):
+        """True if a process of the game's own .exe (run by Wine/Proton) is running."""
+        # Wine shows its own path (Z:\mnt\... or a drive letter for the Steam library,
+        # e.g. S:\steamapps\common\The Isle\...), so compare from steamapps/ on.
+        folder = None
+        if self.folder:
+            folder = str(self.folder).lower().rstrip("/") + "/"
+            if "/steamapps/common/" in folder:
+                folder = "/steamapps/common/" + folder.split("/steamapps/common/", 1)[1]
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    exe = f.read().split(b"\0")[0].decode(errors="replace")
+            except OSError:
+                continue
+            exe = exe.replace("\\", "/").lower()
+            if not exe.endswith(".exe"):
+                continue
+            if exe[1:3] == ":/":                       # Wine path: Z:/mnt/... -> /mnt/...
+                exe = exe[2:]
+            if folder and folder in exe:
+                return True
+            if not folder and "isle" in exe.rsplit("/", 1)[-1]:
+                return True
+        return False
+
+
+XWININFO_LINE = re.compile(r'^\s*0x[0-9a-f]+ "(.*)": \((.*)\)\s+(\d+)x(\d+)')
+
+
+def x11_game_window():
+    """True/False: is the game's window on the X11 (XWayland) window list? None if that
+    can't be checked."""
+    if not os.environ.get("DISPLAY"):
+        return None
+    try:
+        out = subprocess.run(["xwininfo", "-root", "-tree"], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        m = XWININFO_LINE.match(line)
+        if not m:
+            continue
+        name, wm_class, w, h = m.group(1).lower(), m.group(2).lower(), int(m.group(3)), int(m.group(4))
+        if w < 640 or h < 480 or "isle alert" in name:
+            continue                                   # splash screens, our own window
+        if "isle" in name or "isle" in wm_class or "steam_app_376210" in wm_class:
+            return True
+    return False
+
+
 def pump():
     """Keep the window alive while we wait for something."""
     while Gtk.events_pending():
@@ -173,6 +277,7 @@ class Capture:
         self.last_read = self.o2_dump = 0.0
         self.stalled = False
         self.on_stopped = None            # called (main thread) if the capture ends by itself
+        self.notify_end = True            # pop-up when it ends (not with --with-game)
 
     # ---- starting -----------------------------------------------------------
     def start(self):
@@ -256,7 +361,9 @@ class Capture:
                 pipe.set_state(Gst.State.NULL)
                 return None
             if self.frames:
+                print(f"Capture working ({label})", flush=True)
                 return pipe
+        print(f"Capture started ({label}), no frames yet", flush=True)
         return pipe          # no error, just no frame yet (game may be idle): keep waiting
 
     # ---- running (GStreamer thread) ------------------------------------------
@@ -314,7 +421,8 @@ class Capture:
             return
         self.stop()
         self.status = text
-        self.notifier.send("capture", "Isle alert stopped", text)
+        if self.notify_end:
+            self.notifier.send("capture", "Isle alert stopped", text)
         if self.on_stopped:
             self.on_stopped()
 
@@ -344,7 +452,13 @@ class Capture:
             self.close_session = None
 
     def check_stalled(self):
-        if self.pipeline and not self.stalled and time.time() - self.last_frame > 90:
+        now = time.time()
+        if self.pipeline and now - getattr(self, "_rate_t", 0) >= 60:   # frames/s, once a minute
+            if getattr(self, "_rate_t", 0):
+                rate = (self.frames - self._rate_n) / (now - self._rate_t)
+                print(f"Receiving {rate:.1f} frames/s from the game window", flush=True)
+            self._rate_t, self._rate_n = now, self.frames
+        if self.pipeline and not self.stalled and now - self.last_frame > 90:
             self.stalled = True
             self.status = "No frames - is the game minimised or paused?"
             self.notifier.send("stalled", "No frames from the game window",
@@ -353,9 +467,14 @@ class Capture:
 
 # ------------------------------ the window -----------------------------------
 class App(Gtk.Window):
-    def __init__(self, source=None, debug=False):
+    def __init__(self, source=None, debug=False, game=None):
         super().__init__(title=f"The Isle alert {__version__}")
         self.source, self.debug = source, debug
+        # game: a GameWatch when started with --with-game. auto = start watching by itself
+        # when the game window opens (switched off when you press Stop).
+        self.game, self.auto = game, game is not None
+        self.seen = None                  # when the game window was first seen open
+        self.retry_at = 0.0
         self.notifier = Notifier()
         self.capture = None
         self.busy = False
@@ -476,6 +595,9 @@ class App(Gtk.Window):
 
         self.connect("delete-event", self.on_close)
         GLib.timeout_add(500, self.tick)
+        if game:
+            self.set_status("Waiting for the game window to open...")
+            GLib.timeout_add(2000, self.game_tick)
 
     # ---- helpers ---------------------------------------------------------------
     def thresholds(self):
@@ -588,19 +710,24 @@ class App(Gtk.Window):
     def on_toggle(self, _button):
         if self.capture:
             self.stop()
+            self.auto = False                         # you stopped it: don't start again
         else:
             self.start()
+            self.auto = self.game is not None and self.capture is not None
 
-    def start(self):
+    def start(self, auto=False):
         self.busy = True
         self.toggle.set_sensitive(False)
         self.set_status("Choose the game window in the picker that opens...")
         pump()
         logic = AlertLogic(self.notifier, self.thresholds(), REPEATS, blind_after=300)
         cap = Capture(logic, self.notifier, source=self.source, debug=self.debug)
+        cap.notify_end = self.game is None            # with the game: closing it is expected
         error = cap.start()
         self.busy = False
         self.toggle.set_sensitive(True)
+        if error and auto:
+            self.auto = False                         # don't keep opening the picker
         if error == CANCELLED:                        # you closed the picker: not an error
             self.set_status("Not running - no game window was chosen.")
             return
@@ -625,6 +752,7 @@ class App(Gtk.Window):
         self.capture = None
         self.toggle.set_label("Start watching")
         self.set_status(text)
+        self.seen, self.retry_at = None, time.time() + 10
 
     def on_test(self, _button):
         self.notifier.send("Hunger", "Hunger test", "If you can see/hear this, alerts work.")
@@ -646,8 +774,39 @@ class App(Gtk.Window):
         self.save()
         if self.capture:
             self.capture.stop()
+            self.capture = None
+        if self.game and self.game.running():
+            # Steam counts the game as running while Isle Alert is: stay in the background
+            # (no window, no alerts) until the game closes.
+            self.auto = False
+            self.hide()
+            return True
         Gtk.main_quit()
         return False
+
+    def game_tick(self):
+        """--with-game: start watching once the game window is open, quit after the game."""
+        if self.busy:                                 # the window picker is open
+            return True
+        if not self.game.running():
+            print("The game has closed - closing Isle Alert.", flush=True)
+            self.save()
+            if self.capture:
+                self.capture.stop()
+                self.capture = None
+            Gtk.main_quit()
+            return False
+        now = time.time()
+        if not self.auto or self.capture or now < self.retry_at:
+            return True
+        if not self.game.window_open():
+            self.seen = None
+            return True
+        if self.seen is None:
+            self.seen = now
+        elif now - self.seen >= 5:                    # open for a moment: not a splash screen
+            self.start(auto=True)
+        return True
 
     # ---- live update -----------------------------------------------------------
     def tick(self):
@@ -677,13 +836,32 @@ def main():
     p.add_argument("--debug", action="store_true",
                    help="save isle_o2_debug.png whenever O2 is seen below 100%%")
     p.add_argument("--version", action="version", version=f"Isle Alert {__version__}")
-    args = p.parse_args()
-    GLib.set_prgname("isle-alert")
-    GLib.set_application_name("The Isle Alert")
-    Gtk.Window.set_default_icon_name("isle-alert")
-    win = App(source=args.source, debug=args.debug)
-    win.show_all()
-    Gtk.main()
+    p.add_argument("--with-game", metavar="COMMAND", help=(
+        "start the game with this command (everything after it), watch it and close with it. "
+        "Steam launch options: isle-alert --with-game %%command%%"))
+    own_args, game_cmd = split_game_command(sys.argv[1:])
+    args = p.parse_args(own_args)
+    game = None
+    if game_cmd is not None:               # started from Steam: the game goes first, always
+        try:
+            game = GameWatch(start_game(game_cmd), game_cmd)
+        except Exception as exc:
+            print("Could not start the game:", exc, file=sys.stderr)
+            subprocess.run(["notify-send", "Isle Alert could not start the game", str(exc)])
+            sys.exit(1)
+    try:
+        GLib.set_prgname("isle-alert")
+        GLib.set_application_name("The Isle Alert")
+        Gtk.Window.set_default_icon_name("isle-alert")
+        win = App(source=args.source, debug=args.debug, game=game)
+        win.show_all()
+        Gtk.main()
+    except Exception:
+        if game is None:
+            raise
+        import traceback
+        traceback.print_exc()
+        wait_for_game(game.process)        # don't let Steam think the game closed
 
 
 if __name__ == "__main__":

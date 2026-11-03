@@ -254,19 +254,24 @@ def open_portal_stream():
 def pipeline_variants(fd, node, interval):
     """Capture pipelines to try, best first: (label, gst-launch description).
 
-    Only one frame per reading interval is analysed, so the first ones ask the compositor
-    for no more than that - every frame is a full-window copy (~15 MB at 1440p)."""
-    num, den = Fraction(1 / max(interval, 0.1)).limit_denominator(100).as_integer_ratio()
+    Every frame the compositor sends is a full-window copy (~15 MB at 1440p), and only one
+    per reading interval is analysed, so the first ones ask for as few frames as possible.
+    GNOME (mutter) won't go below 1 frame per second: asking for less (e.g. 1/3 for a 3 s
+    interval) fails with "no more input formats", which used to drop us to the uncapped
+    "plain" pipeline - a copy of every game frame (150+ per second). The cap has to be
+    upstream of videoconvert too, or it isn't passed on to the compositor."""
+    num, den = Fraction(max(1.0, 1 / max(interval, 0.1))).limit_denominator(100).as_integer_ratio()
     src = f"pipewiresrc fd={fd} path={node} always-copy=true"
     raw = "video/x-raw,format=BGRx"
-    slow = f"{raw},max-framerate={num}/{den}"
+    cap = f"max-framerate={num}/{den}"
     return [
-        ("low frame rate", f"{src} ! {slow} ! appsink name=sink"),
-        ("low frame rate, videoconvert", f"{src} ! videoconvert ! {slow} ! appsink name=sink"),
-        ("plain", f"{src} ! {raw} ! appsink name=sink"),
-        ("with videoconvert", f"{src} ! videoconvert ! {raw} ! appsink name=sink"),
-        ("no always-copy", f"pipewiresrc fd={fd} path={node} ! videoconvert ! {raw} ! "
-                           "appsink name=sink"),
+        (f"{num / den:g} frame/s", f"{src} ! {raw},{cap} ! appsink name=sink"),
+        (f"{num / den:g} frame/s, videoconvert",
+         f"{src} ! video/x-raw,{cap} ! videoconvert ! {raw} ! appsink name=sink"),
+        ("uncapped (slow!)", f"{src} ! {raw} ! appsink name=sink"),
+        ("uncapped, videoconvert (slow!)", f"{src} ! videoconvert ! {raw} ! appsink name=sink"),
+        ("uncapped, no always-copy (slow!)", f"pipewiresrc fd={fd} path={node} ! videoconvert ! "
+                                             f"{raw} ! appsink name=sink"),
     ]
 
 

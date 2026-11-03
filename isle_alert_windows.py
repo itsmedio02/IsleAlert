@@ -14,6 +14,10 @@ Oxygen plays its sound every 15 seconds while it stays low.
 With --debug, whenever the O2 icon is seen below 100% it saves isle_o2_debug.png next to
 the script, so you can check what the program actually saw.
 Run:              python isle_alert_windows.py
+With the game:    Steam - The Isle - Properties - Launch Options:
+                  "C:\\path\\to\\IsleAlert.exe" --with-game %command%
+                  Steam then starts Isle Alert, which starts the game, starts watching as
+                  soon as the game window opens, and closes when the game closes.
 Other modes:      python isle_alert_windows.py --console --window "The Isle"
                   python isle_alert_windows.py --test screenshot.png
                   python isle_alert_windows.py --notify-test
@@ -30,7 +34,8 @@ import numpy as np
 # Reading the HUD icons, the alert rules, the countdown and the version are shared with the
 # Linux app and live in isle_core.py (next to this file).
 import isle_core
-from isle_core import __version__, AlertLogic, countdown_text, level_text, read_frame, run_test
+from isle_core import (__version__, AlertLogic, countdown_text, game_folder, level_text,
+                       read_frame, run_test, split_game_command, start_game, wait_for_game)
 
 
 def dump_o2(rgb):
@@ -249,6 +254,96 @@ def window_titles():
         return sorted(set(titles), key=str.lower)
     except Exception:
         return []
+
+
+APP_TITLE = "The Isle alert"                 # our own window's title starts with this
+
+
+def _image_path(pid):
+    """Full path of a process's .exe, or None."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.OpenProcess.restype = wintypes.HANDLE
+    h = k32.OpenProcess(0x1000, False, pid)            # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return None
+    try:
+        buf, size = ctypes.create_unicode_buffer(32768), wintypes.DWORD(32768)
+        if k32.QueryFullProcessImageNameW(wintypes.HANDLE(h), 0, buf, ctypes.byref(size)):
+            return buf.value
+        return None
+    finally:
+        k32.CloseHandle(wintypes.HANDLE(h))
+
+
+def _process_paths():
+    """.exe paths of all running processes we may look at."""
+    import ctypes
+    from ctypes import wintypes
+    pids, needed = (wintypes.DWORD * 8192)(), wintypes.DWORD()
+    if not ctypes.windll.kernel32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(needed)):
+        return []
+    return [p for p in (_image_path(pid) for pid in pids[:needed.value // 4] if pid) if p]
+
+
+def _in_folder(path, folder):
+    return os.path.normcase(path).startswith(os.path.normcase(str(folder)).rstrip("\\/") + os.sep)
+
+
+def _top_windows():
+    """(title, process id, client width, client height) of every visible titled window."""
+    import ctypes
+    from ctypes import wintypes
+    user32, out = ctypes.windll.user32, []
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum(hwnd, _lparam):
+        n = user32.GetWindowTextLengthW(hwnd)
+        if n and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            pid, rect = wintypes.DWORD(), wintypes.RECT()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            out.append((buf.value, pid.value, rect.right, rect.bottom))
+        return True
+
+    user32.EnumWindows(enum, 0)
+    return out
+
+
+class GameWatch:
+    """The game Isle Alert started (--with-game): is it still running, and is its window open?
+    The .exe Steam starts may only be a launcher (anti-cheat) that starts the real game and
+    quits, so every process and window from the game's install folder counts."""
+
+    def __init__(self, process, command):
+        self.process, self.folder = process, game_folder(command)
+
+    def running(self):
+        if self.process.poll() is None:
+            return True
+        try:
+            return bool(self.folder) and any(_in_folder(p, self.folder) for p in _process_paths())
+        except Exception:
+            return False
+
+    def window(self):
+        """Title of the game's main window once it is open, otherwise None."""
+        try:
+            for title, pid, w, h in _top_windows():
+                if w < 640 or h < 480 or title.startswith(APP_TITLE):
+                    continue                           # splash screens, our own window
+                if self.folder:
+                    path = _image_path(pid)
+                    if path and _in_folder(path, self.folder):
+                        return title
+                elif "isle" in title.lower():
+                    return title
+        except Exception as exc:
+            print("could not look for the game window:", exc, file=sys.stderr)
+        return None
 
 
 def custom_sounds(cfg):
@@ -475,6 +570,7 @@ class Watcher:
         self.last_frame, self.last_read = time.time(), 0.0
         self.stalled, self.control = False, None
         self.crop, self.crop_for, self.crop_time = None, None, 0.0
+        self.notify_end = True                         # pop-up when the game window closes
 
     def _on_frame(self, frame):
         now = time.time()
@@ -523,7 +619,8 @@ class Watcher:
         def on_closed():
             self.control = None
             self.status = "The game window was closed - capture ended."
-            self.notifier.send("capture", "Isle alert stopped", "The game window was closed.")
+            if self.notify_end:
+                self.notifier.send("capture", "Isle alert stopped", "The game window was closed.")
 
     def start(self):
         try:
@@ -566,7 +663,7 @@ class Watcher:
                                "The game may be minimised or paused - alerts are not working.")
 
 
-def run_gui(args):
+def run_gui(args, game=None):
     import shutil
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -576,10 +673,13 @@ def run_gui(args):
     notifier = WinNotifier(custom_sounds(cfg), volume=_volume(cfg))
     flag = {"front": False}
     notifier.on_alert = lambda: flag.update(front=True)
-    state = {"watcher": None}
+    # game: a GameWatch when started with --with-game. "auto" = start watching by itself
+    # when the game window opens (switched off when you press Stop).
+    state = {"watcher": None, "auto": game is not None, "seen": None, "retry_at": 0.0,
+             "ticks": 0, "hidden": False}
 
     root = tk.Tk()
-    root.title(f"The Isle alert {__version__}")
+    root.title(f"{APP_TITLE} {__version__}")
     root.resizable(False, False)
     frm = ttk.Frame(root, padding=12)
     frm.grid()
@@ -755,16 +855,25 @@ def run_gui(args):
         toggle.config(text="Start watching")
         status.config(text="Stopped")
 
-    def start():
+    def start(title=None):
+        """Start watching. title is given when the game window was found by itself."""
+        auto = title is not None
+        if auto:
+            win_var.set(title)
         title = win_var.get().strip()
         if not title:
             messagebox.showwarning("Pick the game window", "Choose The Isle's window first.")
             return
         logic = AlertLogic(notifier, thresholds(), REPEATS, blind_after=300)
         watcher = Watcher(title, logic, args.interval, notifier, debug=args.debug)
+        watcher.notify_end = game is None            # with the game: closing it is expected
         try:
             watcher.start()
         except Exception as exc:
+            if auto:                                   # the window may still be opening
+                status.config(text=f"Could not watch the game window yet - trying again. ({exc})")
+                state["retry_at"] = time.time() + 10
+                return
             messagebox.showerror("Could not start",
                                  f"{exc}\n\nIs the game running, and not minimised?")
             return
@@ -772,8 +881,15 @@ def run_gui(args):
         persist()
         toggle.config(text="Stop")
 
-    toggle = ttk.Button(frm, text="Start watching",
-                        command=lambda: stop() if state["watcher"] else start())
+    def on_toggle():
+        if state["watcher"]:
+            stop()
+            state["auto"] = False                      # you stopped it: don't start again
+        else:
+            start()
+            state["auto"] = game is not None and state["watcher"] is not None
+
+    toggle = ttk.Button(frm, text="Start watching", command=on_toggle)
     toggle.grid(row=1, column=0, columnspan=2, sticky="we", pady=(10, 0))
     def test_alert():                                   # hunger, thirst, then oxygen sound
         notifier.send("Hunger", "Hunger test", "If you can see/hear this, alerts work.")
@@ -810,20 +926,59 @@ def run_gui(args):
             if w.control is None and state["watcher"]:     # window closed under us
                 toggle.config(text="Start watching")
                 state["watcher"] = None
+                state["seen"], state["retry_at"] = None, time.time() + 10
+        state["ticks"] += 1
+        if game and state["ticks"] % 4 == 0:              # every 2 seconds
+            if game_tick():
+                return
         if flag["front"]:
             flag["front"] = False
             if front_var.get():
                 bring_front()
         root.after(500, tick)
 
-    def on_close():
+    def game_tick():
+        """--with-game: start watching once the game window is open, quit after the game.
+        Returns True when Isle Alert is closing."""
+        now = time.time()
+        if not game.running():
+            print("The game has closed - closing Isle Alert.", flush=True)
+            quit_app()
+            return True
+        if not state["auto"] or state["watcher"] or now < state["retry_at"]:
+            return False
+        title = game.window()
+        if not title:
+            state["seen"] = None
+            if not state["hidden"]:
+                status.config(text="Waiting for the game window to open...")
+        elif state["seen"] is None:
+            state["seen"] = now
+        elif now - state["seen"] >= 5:                 # open for a moment: not a splash screen
+            start(title)
+        return False
+
+    def quit_app():
         persist()
         stop()
         root.destroy()
 
+    def on_close():
+        if game and game.running():
+            # Steam counts the game as running while Isle Alert is: stay in the background
+            # (no window, no alerts) until the game closes.
+            persist()
+            stop()
+            state["auto"], state["hidden"] = False, True
+            root.withdraw()
+            return
+        quit_app()
+
     root.update_idletasks()                         # the window must exist for the title bar colour
     apply_theme(root, style, native, current_theme(), combos=(combo, theme_box))
     root.protocol("WM_DELETE_WINDOW", on_close)
+    if game:
+        status.config(text="Waiting for the game window to open...")
     tick()
     root.mainloop()
 
@@ -863,7 +1018,25 @@ def main():
     p.add_argument("--test", metavar="PNG", help="measure a screenshot file and exit")
     p.add_argument("--version", action="version", version=f"Isle Alert {__version__}")
     p.add_argument("--notify-test", action="store_true", help="send a test alert and exit")
-    args = p.parse_args()
+    p.add_argument("--with-game", metavar="COMMAND", help=(
+        "start the game with this command (everything after it), watch it and close with it.\n"
+        "Steam launch options:  \"C:\\...\\IsleAlert.exe\" --with-game %%command%%"))
+    own_args, game_cmd = split_game_command(sys.argv[1:])
+    args = p.parse_args(own_args)
+    game = None
+    if game_cmd is not None:               # started from Steam: the game goes first, always
+        try:
+            game = GameWatch(start_game(game_cmd), game_cmd)
+        except Exception as exc:
+            print("Could not start the game:", exc, file=sys.stderr)
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                tk.Tk().withdraw()
+                messagebox.showerror("Isle Alert could not start the game", str(exc))
+            except Exception:
+                pass
+            sys.exit(1)
     try:                                   # real pixel sizes, so windowed-mode cropping is exact
         import ctypes
         try:
@@ -875,7 +1048,14 @@ def main():
     args.hunger = args.below if args.hunger is None else args.hunger
     args.thirst = args.below if args.thirst is None else args.thirst
 
-    if args.test:
+    if game:
+        try:
+            run_gui(args, game)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+            wait_for_game(game.process)            # don't let Steam think the game closed
+    elif args.test:
         run_test(args.test)
     elif args.notify_test:
         cfg = load_settings()
